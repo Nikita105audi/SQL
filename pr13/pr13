@@ -1,0 +1,190 @@
+-- ============================================================
+-- ПР13: ключевые поля, индексы, связи между таблицами.
+-- СУБД: SQLite (проверено на 3.50.x), клиент — sqlite3 / DB Browser.
+-- Журнал работы: каждый шаг с комментарием и числом/выводом.
+-- Имена колонок — из базовой схемы (clients, tools, rentals).
+-- ============================================================
+
+-- ---------- Обязательно: включить проверку внешних ключей ----------
+-- В SQLite она выключена внутри сессии по умолчанию (обратная совместимость,
+-- добавлена в 3.6.19 и осталась off). Действует на соединение, не на базу:
+-- в DB Browser — галочка Foreign Keys на панели прагм, в sqliteonline —
+-- настройка соединения. «У меня внешние ключи не работают» почти всегда
+-- означает: галочка не включена.
+PRAGMA foreign_keys = ON;
+-- Проверка: PRAGMA foreign_keys; -> 1 (включено). 0 = выключено.
+
+-- ---------- Часть 1. Ключи под микроскопом ----------
+
+-- Первичные ключи: последний столбец pk в table_info = 1 у ключевой колонки.
+PRAGMA table_info(clients);   -- pk=1 у id (счётчик: AUTOINCREMENT -> rowid)
+PRAGMA table_info(tools);     -- pk=1 у id
+PRAGMA table_info(rentals);   -- pk=1 у id
+
+-- Внешние ключи: колонка -> таблица -> её ключ, ON DELETE, ON UPDATE.
+PRAGMA foreign_key_list(rentals);
+-- id: client_id -> clients(id), on_delete=NO ACTION, on_update=NO ACTION
+-- id: tool_id   -> tools(id),  on_delete=NO ACTION, on_update=NO ACTION
+-- (имена колонок в выводе: id, seq, table, from, to, on_delete, on_update)
+
+-- Паспорт ключей (выписать для каждой своей таблицы):
+--   clients:  PK id (INTEGER PRIMARY KEY AUTOINCREMENT).
+--   tools:    PK id; UNIQUE name — отдельный индекс, не FK.
+--   rentals:  PK id; FK client_id -> clients(id); FK tool_id -> tools(id).
+-- Честность: обе связи в схеме оформлены как FOREIGN KEY с REFERENCES —
+-- «на честном слове» (колонка с чужим номером без REFERENCES) в базе нет.
+-- Проверено прагмой: foreign_key_list(rentals) вернул две строки, а не ноль.
+
+-- ---------- Часть 2. Составной уникальный индекс = бизнес-правило ----------
+-- Правило: один инструмент не может быть выдан дважды в один день.
+-- Сейчас его никто не охраняет — доказываем дублем.
+
+-- 1) Намеренный дубль: инструмент 5 уже выдан 2026-10-20 (id=4 в базе).
+INSERT INTO rentals (client_id, tool_id, rent_date, return_date, deposit)
+VALUES (4, 5, '2026-10-20', '2026-10-21', 1000);   -- вставился! (нет индекса)
+
+-- 2) Индекс поверх грязных данных — СУБД отказала:
+CREATE UNIQUE INDEX uq_tool_day ON rentals (tool_id, rent_date);
+-- Реальное сообщение SQLite: UNIQUE constraint failed: rentals.tool_id, rentals.rent_date
+-- (в данных уже есть пара (5, '2026-10-20') — нарушитель живёт в таблице)
+
+-- 3) Чистим дубль и строим индекс снова — теперь создаётся.
+DELETE FROM rentals WHERE id = 6;    -- дубль, вставленный шагом выше
+CREATE UNIQUE INDEX uq_tool_day ON rentals (tool_id, rent_date);
+-- Создан без ошибки. uq_ — префикс уникальных, idx_ — поисковых.
+
+-- 4) Повторяем вставку дубля — отказ; другой инструмент в тот же день — проходит.
+INSERT INTO rentals (client_id, tool_id, rent_date, return_date, deposit)
+VALUES (4, 5, '2026-10-20', '2026-10-21', 1000);
+-- Сообщение: UNIQUE constraint failed: rentals.tool_id, rentals.rent_date
+-- (та же пара (5, '2026-10-20') — индекс охраняет ПАРУ колонок)
+
+INSERT INTO rentals (client_id, tool_id, rent_date, return_date, deposit)
+VALUES (4, 1, '2026-10-20', '2026-10-21', 1000);
+-- Прошло: инструмент 1 в этот же день — другая пара, индекс не нарушен.
+-- (вставка выше — только для демонстрации; в конце части дубль снят)
+
+-- Своё бизнес-правило для своей базы:
+-- «В одной категории не бывает двух инструментов с одинаковым именем» —
+-- имя само по себе UNIQUE уже есть в tools; пара (category, name) закрывает
+-- правило «имя уникально внутри категории» (одно и то же имя в разных
+-- категориях — допустимо, в одной — нет).
+CREATE UNIQUE INDEX uq_tool_cat_name ON tools (category, name);
+-- Проверка нарушением:
+INSERT INTO tools (name, category, price_per_day)
+VALUES ('Дрель ударная', 'электро', 330);
+-- Сообщение: UNIQUE constraint failed: tools.category, tools.name
+-- (в категории «электро» уже есть «Дрель ударная» — пара занята)
+-- Итог части 2: два уникальных индекса — uq_tool_day (пара выдач) и
+-- uq_tool_cat_name (пара категории-имени). Оба проверены попыткой нарушения.
+
+-- ---------- Часть 3. Обычный индекс и план запроса ----------
+
+-- План ДО индекса: как СУБД выполняет запрос внутри.
+EXPLAIN QUERY PLAN SELECT * FROM rentals WHERE client_id = 1;
+-- Вывод (реальный, SQLite): SCAN rentals
+--   0|0|0|SCAN rentals
+-- Полный перебор всех строк таблицы, условие проверяется на каждой.
+
+CREATE INDEX idx_rentals_client ON rentals (client_id);
+-- Обычный индекс: не ради уникальности, ради скорости поиска.
+-- Классика: индексируют внешние ключи и колонки из частых WHERE.
+-- Цена: индекс обновляется при каждой вставке/изменении и занимает место.
+
+-- План ПОСЛЕ индекса:
+EXPLAIN QUERY PLAN SELECT * FROM rentals WHERE client_id = 1;
+-- Вывод (реальный, SQLite): SEARCH rentals USING INDEX idx_rentals_client (client_id=?)
+--   0|0|0|SEARCH rentals USING INDEX idx_rentals_client (client_id=?)
+-- Разница словами: SCAN читает всю таблицу и проверяет условие на каждой
+-- строке (на N строках — N проверок); SEARCH идёт по отсортированному
+-- индексу прямо к нужным строкам (к страницам с client_id=1), остальные
+-- не читает. На больших таблицах разница — порядки величины.
+
+-- ---------- Часть 4. Что СУБД делает с «детьми» при удалении «родителя» ----------
+-- По умолчанию — NO ACTION: запрет (это и падало в ПР11 при удалении клиента
+-- с выдачами). Два других поведения — на демо-таблицах, основную базу не трогаем.
+
+-- 4.1. CASCADE: удаление владельца тянет за собой подчинённые строки.
+CREATE TABLE clients_demo (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL
+);
+CREATE TABLE orders_demo (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id INTEGER NOT NULL REFERENCES clients_demo(id) ON DELETE CASCADE,
+  item      TEXT NOT NULL
+);
+INSERT INTO clients_demo (name) VALUES ('Демо-клиент'), ('Второй');
+INSERT INTO orders_demo (client_id, item) VALUES
+  (1, 'аренда дрели'), (1, 'аренда молотка'), (2, 'аренда косилки');
+
+DELETE FROM clients_demo WHERE id = 1;
+SELECT * FROM orders_demo;
+-- 3 строки -> 1 строка: заказы первого клиента (аренда дрели, аренда молотка)
+-- исчезли вместе с владельцем; заказ второго (аренда косилки) цел.
+-- Прагма это же подтверждает как часть схемы:
+PRAGMA foreign_key_list(orders_demo);
+-- on_delete = CASCADE (в выводе — колонка on_delete)
+-- [note] CASCADE молча игнорируется, пока foreign_keys = OFF — прагма в начале обязательна.
+
+-- 4.2. SET NULL: ссылка обнуляется, сама строка остаётся жива.
+-- Колонка обязана допускать NULL (без NOT NULL) — иначе отказ при создании.
+CREATE TABLE clients_demo2 (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL
+);
+CREATE TABLE orders_demo2 (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id INTEGER REFERENCES clients_demo2(id) ON DELETE SET NULL,  -- без NOT NULL
+  item      TEXT NOT NULL
+);
+INSERT INTO clients_demo2 (name) VALUES ('Демо-клиент 2');
+INSERT INTO orders_demo2 (client_id, item) VALUES (1, 'аренда перфоратора');
+
+DELETE FROM clients_demo2 WHERE id = 1;
+SELECT * FROM orders_demo2;
+-- Строка жива: id=1, client_id = NULL, item='аренда перфоратора'.
+-- Ссылка обнулилась, заказ не потерян. Прагма:
+PRAGMA foreign_key_list(orders_demo2);   -- on_delete = SET NULL
+
+-- 4.3. Выбор поведения для связей СВОЕЙ базы (словами, связи не пересоздаём):
+--   rentals.client_id -> clients.id : ЗАПРЕТ (NO ACTION, как сейчас).
+--     История выдач — это учёт: кто и что брал. Удалять клиента вместе с
+--     его выдачами (CASCADE) — терять историю проката; обнулять ссылку
+--     (SET NULL) — оставлять выдачи «ничьи», что ломает отчёт «кто брал».
+--     Клиента нельзя удалять, пока за ним числятся выдачи — это правильно:
+--     сначала закрыть/вернуть выдачи, потом удалять. Учёт важнее удобства.
+--   rentals.tool_id -> tools.id : ЗАПРЕТ (NO ACTION).
+--     Инструмент может быть в истории выдач и после списания — выдача должна
+--     остаться читаемой (что было выдано). Каскад стёр бы историю вместе с
+--     карточкой инструмента; обнуление сделало бы выдачу безымянной.
+--   (в clients/phones и tools/name ссылок-«детей» нет — там только PK и UNIQUE)
+-- Правило для выбора: историю/учёт — запрет; мусорные строки без ценности
+-- (сессии, логи, временные связи) — каскад; факт важен, владелец нет
+-- (например, «кто создал запись» — атрибуция, а не учёт) — обнуление.
+
+-- ---------- Часть 5. Инвентаризация базы ----------
+-- Все индексы, созданные не системой (sqlite_* — служебные, отбрасываем).
+SELECT name, tbl_name FROM sqlite_master
+WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
+ORDER BY name;
+-- Ожидаемый список после частей 2–3:
+--   idx_rentals_client   (rentals) — наш поисковый (часть 3)
+--   uq_tool_cat_name     (tools)   — наше бизнес-правило (часть 2)
+--   uq_tool_day          (rentals) — наше бизнес-правило (часть 2)
+--   sqlite_autoindex_*   — автоматические: PK у каждой таблицы и UNIQUE name
+--                            у tools; их в списке нет (отфильтрованы LIKE).
+-- «До и после»: первая запись журнала — пусто (до частей 2–3 индексов не
+-- было, кроме автоматических); последняя — три строки uq_/idx_ выше.
+-- Сверка с ожиданиями: у каждой таблицы свой автоматический индекс ключа
+-- (создаётся СУБД сама), наши именованные — ровно три, с префиксами uq_/idx_.
+
+-- ---------- Служебное: снять демо-таблицы и дубль демонстрации ----------
+DROP TABLE IF EXISTS orders_demo2;
+DROP TABLE IF EXISTS clients_demo2;
+DROP TABLE IF EXISTS orders_demo;
+DROP TABLE IF EXISTS clients_demo;
+-- Демонстрационная вставка «другой инструмент в тот же день» (часть 2, шаг 4)
+-- остаётся в rentals до конца работы — это легальная строка (пара 1|2026-10-20
+-- уникальна), не дубль. Если нужна чистота — снимите её явно:
+-- DELETE FROM rentals WHERE client_id = 4 AND tool_id = 1 AND rent_date = '2026-10-20';
