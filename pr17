@@ -1,0 +1,122 @@
+-- ================ МЕНЮ БАЗЫ ПРОКАТА ================
+-- ПР17: пункты меню = виды; исполнение сверху вниз.
+-- 1. СОЗДАТЬ  — пять CREATE VIEW (срезы данных)
+-- 2. ПОКАЗАТЬ — SELECT от каждого вида
+-- 3. НАЙТИ    — уточняющие запросы поверх видов
+-- 4. ИЗМЕНИТЬ — пересоздание вида с новой колонкой
+-- 5. УДАЛИТЬ  — DROP VIEW IF EXISTS (чистка)
+-- =====================================================
+-- СУБД: SQLite (проверено на 3.50.x). Диалектные отличия
+-- помечены [note]. Порядок: секции 1–5, внутри — сверху вниз.
+
+-- ---------- 1. СОЗДАТЬ: пять «пунктов меню» ----------
+
+-- Пункт «прайс»: только названия и цены — срез колонок (проекция).
+-- Отвечает: «что у нас есть и сколько стоит в день?»
+CREATE VIEW v_price AS
+SELECT name, price_per_day FROM tools;
+
+-- Пункт «на руках»: только невозвращённые выдачи — срез строк (фильтр, NULL-логика).
+-- Отвечает: «кто сейчас держит инструмент и не вернул?»
+CREATE VIEW v_open AS
+SELECT id, client_id, tool_id, rent_date, deposit
+FROM rentals
+WHERE return_date IS NULL;
+
+-- Пункт «карточка выдачи»: выдача с именами клиента и инструмента — срез-соединение.
+-- Отвечает: «в какой выдаче кто и что взял, с датами и залогом?»
+CREATE VIEW v_rentals_full AS
+SELECT r.id, c.name AS client, t.name AS tool,
+       r.rent_date, r.return_date, r.deposit
+FROM rentals r
+JOIN clients c ON r.client_id = c.id
+JOIN tools t   ON r.tool_id = t.id;
+
+-- Пункт «клиенты в цифрах»: сколько выдач и залогов на каждом — сводка с GROUP BY.
+-- Отвечает: «кто сколько раз брал и на какую сумму залогов?»
+CREATE VIEW v_client_deposits AS
+SELECT c.name, COUNT(r.id) AS rentals_cnt,
+       SUM(r.deposit) AS deposits_total
+FROM clients c
+LEFT JOIN rentals r ON r.client_id = c.id
+GROUP BY c.id, c.name;
+
+-- Пункт «на руках с именами»: вид поверх вида (один уровень надстройки — рабочий масштаб).
+-- Отвечает: «кто сейчас держит что именно, человеческими именами?»
+CREATE VIEW v_open_full AS
+SELECT * FROM v_rentals_full
+WHERE return_date IS NULL;
+
+-- ---------- 2. ПОКАЗАТЬ: SELECT от каждого вида ----------
+
+-- «прайс»: весь список, от дорогого к дешёвому
+SELECT name, price_per_day FROM v_price
+ORDER BY price_per_day DESC;
+
+-- «на руках»: все текущие выдачи
+SELECT id, client_id, tool_id, rent_date, deposit FROM v_open;
+
+-- «карточка выдачи»: все выдачи с именами
+SELECT id, client, tool, rent_date, return_date, deposit
+FROM v_rentals_full;
+
+-- «клиенты в цифрах»: сводка по каждому
+SELECT name, rentals_cnt, deposits_total FROM v_client_deposits;
+
+-- «на руках с именами»: две-три строки текущих выдач
+SELECT client, tool, rent_date FROM v_open_full;
+
+-- ---------- 3. НАЙТИ: уточнения поверх видов ----------
+
+-- «дорогой прайс»: только от 120 в день (WHERE поверх проекции)
+SELECT name, price_per_day FROM v_price
+WHERE price_per_day >= 120;
+
+-- «свежие выдачи на руках»: невозвращённое, взятое с 1 ноября (ORDER BY поверх фильтра)
+SELECT id, client_id, tool_id, rent_date FROM v_open
+ORDER BY rent_date DESC;
+
+-- «кто держит больше одной вещи»: поверх сводки (HAVING поверх агрегата)
+SELECT name, rentals_cnt FROM v_client_deposits
+WHERE rentals_cnt > 1;
+
+-- «крупные залоги на руках»: поверх надстройки (WHERE поверх вида-поверх-вида)
+SELECT client, tool, deposit FROM v_open_full
+WHERE deposit >= 300;
+
+-- ---------- 4. ИЗМЕНИТЬ: пересоздание вида с новой колонкой ----------
+-- SQLite: ALTER VIEW и CREATE OR REPLACE VIEW НЕ поддерживаются —
+-- оба падают синтаксической ошибкой (проверено, см. README).
+-- Родной путь: DROP VIEW + CREATE VIEW под тем же именем.
+-- Дописываем category в конец списка колонок v_price.
+
+DROP VIEW v_price;
+CREATE VIEW v_price AS
+SELECT name, price_per_day, category FROM tools;
+
+-- Проверка: новая колонка видна, старые на месте
+SELECT name, price_per_day, category FROM v_price
+ORDER BY price_per_day DESC;
+
+-- ---------- 5. УДАЛИТЬ: чистка вспомогательного вида ----------
+-- v_open_full — надстройка, решили не оставлять в «меню».
+-- IF EXISTS — чтобы повторный DROP не падал (проверено: второй
+-- DROP VIEW без IF EXISTS даёт «no such view: v_open_full»).
+
+DROP VIEW IF EXISTS v_open_full;
+
+-- Повторный DROP — молча, без ошибки: вид уже удалён, IF EXISTS гасит.
+DROP VIEW IF EXISTS v_open_full;
+
+-- Проверка, что таблицы и остальные виды живы:
+SELECT COUNT(*) AS tools_rows FROM tools;          -- таблица на месте
+SELECT name FROM v_price LIMIT 1;                  -- вид v_price работает
+SELECT COUNT(*) AS open_rows FROM v_open;          -- вид v_open работает
+
+-- ---------- Оглавление «меню»: список видов ----------
+-- SQLite: каталог — sqlite_master (в новых версиях — sqlite_schema).
+-- После пяти CREATE VIEW запрос вернёт 5 строк (v_open_full к моменту
+-- проверки уже удалён в секции 5 — тогда 4; проверяйте до секции 5).
+SELECT name, type FROM sqlite_master WHERE type = 'view';
+-- [note] PostgreSQL / SQL Server: SELECT table_name FROM information_schema.views;
+-- [note] MySQL: SHOW FULL TABLES WHERE Table_type = 'VIEW';
