@@ -1,0 +1,249 @@
+-- ============================================================
+-- ПР16: массовая загрузка — многострочный VALUES, INSERT … SELECT,
+--       временная таблица-буфер, CSV экспорт/импорт, сверка агрегатами.
+-- СУБД: SQLite (проверено на 3.50.x). Диалектные отличия — [note].
+-- Порядок: секции 1–5, исполнять сверху вниз.
+-- ============================================================
+
+-- ---------- 0. Затравка (если база чистая; на своей — пропустите) ----------
+CREATE TABLE IF NOT EXISTS clients (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT
+);
+CREATE TABLE IF NOT EXISTS tools (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+  category TEXT NOT NULL, price_per_day REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rentals (
+  id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id),
+  tool_id INTEGER NOT NULL REFERENCES tools(id),
+  rent_date TEXT NOT NULL, return_date TEXT, deposit REAL NOT NULL
+);
+-- (засев из задания — здесь опущен: на своей базе он уже есть)
+
+-- ---------- 1. Многострочный VALUES — массив строк ----------
+
+-- До вставки: сколько строк было
+SELECT COUNT(*) FROM clients;   -- 5 (на чистой базе после засева)
+
+-- Батч из трёх клиентов одной командой
+INSERT INTO clients (id, name, phone) VALUES
+  (6, 'Фёдорова Ольга', '+7 915 333-44-55'),
+  (7, 'Морозов Данил',  NULL),
+  (8, 'Николаева Вера', '+7 916 444-55-66');
+
+-- После вставки: сколько стало и что за строки добавились
+SELECT COUNT(*) FROM clients;                            -- 8
+SELECT id, name FROM clients ORDER BY id DESC LIMIT 3;   -- 8/7/6, новый батч
+
+-- Намеренно сломанный кортеж: три значения, колонок названо две.
+-- Вся вставка атомарна — ни одна строка батча не попадает в таблицу.
+INSERT INTO clients (id, name) VALUES (9, 'Тестов Тест', '+7 900 000-00-00');
+-- Реальное сообщение SQLite: 3 values for 2 columns
+-- (без списка колонок было бы: table clients has 3 columns but 2 values were supplied)
+-- После ошибки COUNT(*) остался 8 — «половинного» результата нет.
+
+-- Свой батч выдач: 4 строки, у двух return_date пустой (пригодятся в части 5)
+INSERT INTO rentals (id, client_id, tool_id, rent_date, return_date, deposit) VALUES
+  (9,  4, 5, '2026-11-15', NULL,        200),
+  (10, 5, 6, '2026-11-18', NULL,        350),
+  (11, 1, 7, '2026-11-20', '2026-11-22', 700),
+  (12, 2, 8, '2026-11-21', '2026-11-23', 150);
+
+-- Сверка батча выдач: до/после
+SELECT COUNT(*), SUM(deposit) FROM rentals;   -- было 8 | 5450.0
+                                              -- стало 12 | 6850.0
+
+-- ---------- 2. INSERT … SELECT — массив, который вернул запрос ----------
+
+-- Архивная таблица (копия структуры rentals)
+CREATE TABLE rentals_archive (
+  id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, tool_id INTEGER NOT NULL,
+  rent_date TEXT NOT NULL, return_date TEXT, deposit REAL NOT NULL
+);
+
+-- Эталон «до» переноса — зафиксировать заранее
+SELECT COUNT(*), SUM(deposit) FROM rentals;   -- 12 | 6850.0  (после батча части 1)
+
+-- Перенос: закрытые выдачи октября (return_date заполнен И дата до 1 ноября)
+INSERT INTO rentals_archive (id, client_id, tool_id, rent_date, return_date, deposit)
+SELECT id, client_id, tool_id, rent_date, return_date, deposit
+FROM rentals
+WHERE return_date IS NOT NULL AND rent_date < '2026-11-01';
+-- В архив уехало 4 строки (ids 1–4), SUM(deposit) в архиве — 2900.0
+
+-- Удаление из источника тем же условием — настоящий перенос
+DELETE FROM rentals
+WHERE return_date IS NOT NULL AND rent_date < '2026-11-01';   -- удалено 4 строки
+
+-- Три пары чисел (в комментарии — как в задании):
+--   до переноса:      12 | 6850.0   (после батча части 1; на чистой базе 8 | 5450.0)
+--   в архиве:          4 | 2900.0
+--   после удаления:    8 | 3950.0
+-- Контрольное равенство: 3950.0 (остаток) + 2900.0 (архив) = 6850.0 — ничего не потеряно.
+SELECT COUNT(*), SUM(deposit) FROM rentals;                   -- 8 | 3950.0
+SELECT (SELECT SUM(deposit) FROM rentals)
+     + (SELECT SUM(deposit) FROM rentals_archive);            -- 6850.0
+
+-- Условие «закрытые выдачи ноября» — только посчитать, НЕ переносить
+SELECT COUNT(*) FROM rentals
+WHERE return_date IS NOT NULL AND rent_date >= '2026-11-01';   -- 2 (ids 11, 12)
+
+-- INSERT … SELECT из литерального набора (UNION ALL, без таблицы-буфера)
+INSERT INTO tools (id, name, category, price_per_day)
+  SELECT 9,  'Степлер строительный', 'Ручной инструмент', 110
+  UNION ALL
+  SELECT 10, 'Тестер напряжения',     'Электроинструмент', 150;
+
+SELECT COUNT(*) FROM tools;   -- 10
+
+-- ---------- 3. Временная таблица — буфер перед загрузкой ----------
+
+CREATE TEMP TABLE stage_tools (
+  s_id INTEGER PRIMARY KEY,   -- ключ партии, не справочника
+  t_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL,
+  price_per_day REAL NOT NULL
+);
+
+INSERT INTO stage_tools (s_id, t_id, name, category, price_per_day) VALUES
+  (1, 11, 'Ключ разводной', 'Ручной инструмент', 70),
+  (2, 12, 'Ключ разводной', 'Ручной инструмент', 70),
+  (3, 13, 'Генератор',      'Электроинструмент', 900),
+  (4, 14, 'Лобзик',         'Электроинструмент', 310),
+  (5, 15, 'Перфоратор',     'Электроинструмент', 420),
+  (6, 16, 'Теодолит',       'Измерение', 500);
+
+-- Обе проверки буфера: сколько строк и сколько разных имён
+SELECT COUNT(*), COUNT(DISTINCT name) FROM stage_tools;   -- 6 и 5
+-- Дубль внутри партии:
+SELECT name, COUNT(*) AS n FROM stage_tools
+GROUP BY name HAVING COUNT(*) > 1;                        -- Ключ разводной | 2
+
+-- Неудачный перенос ДО чистки: обе строки «Ключ разводной» проходят NOT IN
+-- (он сверяет партию со справочником, а не строки между собой), вторая
+-- упирается в UNIQUE.
+INSERT INTO tools (id, name, category, price_per_day)
+SELECT t_id, name, category, price_per_day
+FROM stage_tools
+WHERE name NOT IN (SELECT name FROM tools);
+-- Реальное сообщение SQLite: UNIQUE constraint failed: tools.name
+-- COUNT(*) в tools остался 10 — вставка откатилась целиком.
+
+-- Чистка партии: дубль удалён до переноса
+DELETE FROM stage_tools WHERE s_id = 2;
+
+-- Удачный перенос: фильтр NOT IN отсекает «Перфоратор» (уже в tools)
+INSERT INTO tools (id, name, category, price_per_day)
+SELECT t_id, name, category, price_per_day
+FROM stage_tools
+WHERE name NOT IN (SELECT name FROM tools);   -- вставлено 4 строки
+
+SELECT COUNT(*) FROM tools;                   -- 14
+SELECT id, name FROM tools WHERE id > 10 ORDER BY id;
+-- 11 Ключ разводной, 13 Генератор, 14 Лобзик, 16 Теодолит
+-- (пробел в id 12/15 — нормальное следствие фильтрации)
+
+-- SELECT-часть переноса отдельно, без INSERT: какие строки отобрались
+SELECT t_id, name FROM stage_tools
+WHERE name NOT IN (SELECT name FROM tools);
+-- «Перфоратор» не попал: его имя уже есть в tools — фильтр NOT IN отсёк строку
+-- целиком, а не «пропустил с другим id». NOT IN сверяет по имени, не по id.
+-- [note] надёжная замена при NULL в подзапросе — NOT EXISTS:
+--   WHERE NOT EXISTS (SELECT 1 FROM tools t WHERE t.name = stage_tools.name)
+
+-- ---------- 4. Ввод-вывод: CSV из базы и обратно ----------
+
+-- Приёмник — точная копия tools по колонкам
+CREATE TABLE tools_import (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+  category TEXT NOT NULL, price_per_day REAL NOT NULL
+);
+
+-- Экспорт (sqlite3-клиент; команды — вне SQL, см. README):
+--   .headers on
+--   .mode csv
+--   .once tools.csv
+--   SELECT id, name, category, price_per_day FROM tools ORDER BY id;
+-- В tools.csv: 15 строк (заголовок + 14 данных), тексты в двойных кавычках,
+-- числа без кавычек (350.0, 90.0, …), файл в UTF-8.
+
+-- Импорт (sqlite3-клиент):
+--   .import --csv --skip 1 tools.csv tools_import
+-- --csv задаёт формат, --skip 1 пропускает строку заголовка.
+
+-- Сверка: две пары одинаковых запросов, источник и приёмник
+SELECT COUNT(*) FROM tools_import;                     -- 14
+SELECT COUNT(*), SUM(price_per_day) FROM tools;        -- 14 | 3640.0
+SELECT COUNT(*), SUM(price_per_day) FROM tools_import; -- 14 | 3640.0
+SELECT id, name, price_per_day, typeof(price_per_day)
+FROM tools_import LIMIT 3;                             -- 1 | Дрель ударная | 350.0 | real
+-- typeof = real: .import кладёт из файла текст, но тип колонки превращает
+-- '350.0' в число 350.0 — данные сразу пригодны для агрегатов.
+-- [note] если в вашей СУБД легло текстом — CAST в staging-таблице, до переноса.
+
+-- Ловушка заголовка: импорт БЕЗ --skip 1 в приёмник с числовыми колонками
+--   .import --csv tools.csv tools_import
+-- Реальное поведение SQLite: INSERT failed: datatype mismatch — текст 'id'
+-- не лезет в INTEGER PRIMARY KEY; при этом COUNT(*) остаётся 14, ошибку легко
+-- не заметить в логе большой загрузки.
+-- В приёмнике «все TEXT» заголовок молча становится строкой данных:
+CREATE TABLE tools_import_t (id TEXT, name TEXT, category TEXT, price_per_day TEXT);
+--   .import --csv tools.csv tools_import_t
+SELECT COUNT(*) FROM tools_import_t;   -- 15, а не 14!
+SELECT id, name, price_per_day, typeof(price_per_day)
+FROM tools_import_t LIMIT 2;           -- строка 1: id | name | price_per_day | text
+SELECT SUM(price_per_day) FROM tools_import_t;   -- 3640.0 — и не подсказывает!
+-- COUNT ловит лишнюю строку сразу (15 против 14), SUM — нет: числовые тексты
+-- при сложении превращаются в числа. После любого импорта первым идёт COUNT.
+
+-- Чистка мусорной строки и повторная сверка
+DELETE FROM tools_import_t WHERE id = 'id';
+SELECT COUNT(*), SUM(price_per_day) FROM tools_import_t;   -- 14 | 3640.0
+
+-- ---------- 5. Функции над наборами строк — приёмка загрузки ----------
+
+-- Карточка rentals после октябрьского переноса (на данных задания — 4 строки)
+SELECT COUNT(*), SUM(deposit), AVG(deposit), MIN(deposit), MAX(deposit)
+FROM rentals;   -- 4 | 2550.0 | 637.5 | 150.0 | 1000.0
+-- На своей базе после частей 1–2 числа будут своими; методика та же.
+
+-- Сверка переноса одним запросом: строки и сумма с обеих сторон
+SELECT (SELECT COUNT(*) FROM rentals)
+     + (SELECT COUNT(*) FROM rentals_archive)    AS rows_total,
+       (SELECT SUM(deposit) FROM rentals)
+     + (SELECT SUM(deposit) FROM rentals_archive) AS deposit_total;
+-- 8 | 5450.0 на чистой базе задания; после батча части 1 — 12 | 6850.0.
+-- Ровно столько, сколько было в rentals до переноса: приёмка закрыта.
+
+-- Сверка CSV-загрузки одним запросом (источник и приёмник)
+SELECT (SELECT COUNT(*) FROM tools)           AS src_rows,
+       (SELECT SUM(price_per_day) FROM tools) AS src_sum,
+       (SELECT COUNT(*) FROM tools_import)    AS dst_rows,
+       (SELECT SUM(price_per_day) FROM tools_import) AS dst_sum;
+-- 14 | 3640.0 | 14 | 3640.0
+
+-- COUNT с аргументом: считает только заполненные значения
+SELECT COUNT(*) AS vsego, COUNT(phone) AS s_telefonom FROM clients;   -- 8 | 5
+-- Клиентов 8, телефонов 5: у Смирновой и Морозова NULL — разница (3) и есть число пустых.
+
+-- Один осмысленный GROUP BY: сумма залога по клиентам (вопрос: кто сколько
+-- оставил в залоге по всем своим выдачам, включая закрытые и открытые)
+SELECT c.name, COUNT(r.id) AS rentals_cnt, SUM(r.deposit) AS deposits_total
+FROM clients c
+LEFT JOIN rentals r ON r.client_id = c.id
+GROUP BY c.id, c.name
+ORDER BY deposits_total DESC;
+
+-- Группировка справочника по категориям (как в задании)
+SELECT category,
+       COUNT(*) AS positions,
+       ROUND(AVG(price_per_day), 2) AS avg_price,
+       MIN(price_per_day) AS min_price,
+       MAX(price_per_day) AS max_price
+FROM tools
+GROUP BY category
+ORDER BY category;
+-- Измерение 3/260.0/40.0–500.0; Ручной инструмент 5/90.0/60.0–120.0;
+-- Электроинструмент 6/401.67/150.0–900.0. Без ROUND средняя по электрике —
+-- 401.666666666667: округляйте в запросе, а не в голове.
